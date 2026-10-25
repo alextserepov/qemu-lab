@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# QEMU x86_64 + OVMF Secure Boot lab. No root needed to run.
+set -Eeuo pipefail
+
+LAB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${SB_LAB_STATE_DIR:-$LAB_DIR/work}"
+ESP_DIR="$STATE_DIR/esp"
+KEY_DIR="$ESP_DIR/KEYS"
+VARS_FILE="$STATE_DIR/OVMF_VARS.fd"
+OWNER_GUID="${SB_LAB_OWNER_GUID:-d719b2cb-3d3a-4cba-8d5e-828a784cbbad}"
+
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "Missing command: $1"; }
+abs_file() { [[ -f "$1" ]] || fail "No such file: $1"; (cd -- "$(dirname -- "$1")" && printf '%s/%s\n' "$PWD" "$(basename -- "$1")"); }
+
+usage() {
+cat <<'USAGE'
+QEMU x86_64 UEFI Secure Boot lab (host: Linux)
+
+  ./sb-lab init [--pk PK.pem|cer --kek KEK.pem|cer --db DB.pem|cer ...]
+  ./sb-lab keys --pk PK.pem|cer --kek KEK.pem|cer --db DB.pem|cer [--db DB2.cer ...] [--dbx revocation-cert.cer ...]
+  ./sb-lab boot [--efi signed.efi | --disk uefi-disk.img | --iso installer.iso] [--no-kvm]
+  ./sb-lab enroll-offline     # requires virt-fw-vars; replaces VM's NVRAM
+  ./sb-lab status
+  ./sb-lab sign --efi input.efi --key DB.key --cert DB.pem --out signed.efi
+  ./sb-lab reset --yes       # resets firmware variables, NOT staged keys
+
+Environment overrides:
+  OVMF_CODE=/path/to/OVMF_CODE_4M.secboot.fd
+  OVMF_VARS_TEMPLATE=/path/to/OVMF_VARS_4M.fd
+  QEMU_BIN=/path/to/qemu-system-x86_64
+  SB_LAB_STATE_DIR=/path/to/work
+
+Run 'init' once, 'boot' to enroll keys manually in UEFI setup, and 'boot --efi'
+to verify the signed EFI program. For immediate Secure Boot=1, use
+'enroll-offline' after staging your keys (requires virt-fw-vars).
+USAGE
+}
+
+find_firmware() {
+    CODE_PATH="${OVMF_CODE:-}"
+    VARS_TEMPLATE_PATH="${OVMF_VARS_TEMPLATE:-}"
+    if [[ -n "$CODE_PATH" || -n "$VARS_TEMPLATE_PATH" ]]; then
+        [[ -n "$CODE_PATH" && -n "$VARS_TEMPLATE_PATH" ]] || fail "Set BOTH OVMF_CODE and OVMF_VARS_TEMPLATE when overriding firmware."
+    else
+        local pair code vars
+        local -a pairs=(
+            '/usr/share/OVMF/OVMF_CODE_4M.secboot.fd|/usr/share/OVMF/OVMF_VARS_4M.fd'
+            '/usr/share/edk2/ovmf/OVMF_CODE_4M.secboot.fd|/usr/share/edk2/ovmf/OVMF_VARS_4M.fd'
+            '/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd|/usr/share/edk2/x64/OVMF_VARS.4m.fd'
+            '/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd|/usr/share/edk2/ovmf/OVMF_VARS.fd'
+            '/usr/share/OVMF/OVMF_CODE.secboot.fd|/usr/share/OVMF/OVMF_VARS.fd'
+            '/usr/share/OVMF/x64/OVMF_CODE.secboot.fd|/usr/share/OVMF/x64/OVMF_VARS.fd'
+            '/usr/share/edk2-ovmf/x64/OVMF_CODE.secboot.fd|/usr/share/edk2-ovmf/x64/OVMF_VARS.fd'
+            '/usr/share/edk2/x64/OVMF_CODE.secboot.fd|/usr/share/edk2/x64/OVMF_VARS.fd'
+        )
+        for pair in "${pairs[@]}"; do
+            code="${pair%%|*}"
+            vars="${pair#*|}"
+            if [[ -s "$code" && -s "$vars" ]]; then
+                CODE_PATH="$code"
+                VARS_TEMPLATE_PATH="$vars"
+                break
+            fi
+        done
+    fi
+    [[ -s "$CODE_PATH" ]] || fail "Secure-Boot OVMF CODE not found. Install 'ovmf', or set OVMF_CODE and OVMF_VARS_TEMPLATE."
+    [[ -s "$VARS_TEMPLATE_PATH" ]] || fail "Blank OVMF VARS template not found. Install 'ovmf', or set OVMF_VARS_TEMPLATE."
+    [[ "$(stat -c '%s' "$CODE_PATH")" -ge 1048576 ]] || fail "Firmware CODE looks too small: $CODE_PATH"
+    [[ "$(stat -c '%s' "$VARS_TEMPLATE_PATH")" -ge 65536 ]] || fail "Firmware VARS template looks too small: $VARS_TEMPLATE_PATH"
+}
+
+ensure_initialized() {
+    find_firmware
+    mkdir -p "$KEY_DIR" "$ESP_DIR/EFI/BOOT"
+    if [[ ! -f "$VARS_FILE" ]]; then
+        cp -- "$VARS_TEMPLATE_PATH" "$VARS_FILE"
+        chmod u+rw "$VARS_FILE"
+        info "Created persistent UEFI variables: $VARS_FILE"
+        info "Started in Setup Mode: Secure Boot is not enforced until PK/KEK/db are enrolled."
+    fi
+}
+
+convert_x509_to_der() {
+    local src="$1" dst="$2" fmt
+    need openssl
+    src="$(abs_file "$src")"
+    if openssl x509 -inform PEM -in "$src" -noout >/dev/null 2>&1; then
+        fmt=PEM
+    elif openssl x509 -inform DER -in "$src" -noout >/dev/null 2>&1; then
+        fmt=DER
+    else
+        fail "Not an X.509 PEM/DER certificate: $src (ESL/auth bundles are not accepted by this staging helper)"
+    fi
+    local tmp="${dst}.tmp.$$"
+    openssl x509 -inform "$fmt" -in "$src" -outform DER -out "$tmp"
+    mv -f -- "$tmp" "$dst"
+    info "Staged $(basename "$dst") from $src"
+}
+
+stage_keys() {
+    local pk='' kek='' dbx='' token
+    local -a dbs=() dbxs=()
+    while (($#)); do
+        token="$1"
+        case "$token" in
+            --pk|--kek|--db|--dbx)
+                (($# >= 2)) || fail "$token requires a filename"
+                case "$token" in
+                    --pk) pk="$2";;
+                    --kek) kek="$2";;
+                    --db) dbs+=("$2");;
+                    --dbx) dbxs+=("$2");;
+                esac
+                shift 2;;
+            *) fail "Unknown keys option: $token";;
+        esac
+    done
+    [[ -n "$pk" && -n "$kek" && ${#dbs[@]} -gt 0 ]] || fail "Provide --pk, --kek and at least one --db (all three are required)."
+    ensure_initialized
+    convert_x509_to_der "$pk" "$KEY_DIR/PK.cer"
+    convert_x509_to_der "$kek" "$KEY_DIR/KEK.cer"
+    rm -f -- "$KEY_DIR"/DB*.cer "$KEY_DIR"/DBX*.cer
+    local i
+    for i in "${!dbs[@]}"; do
+        if ((i == 0)); then
+            convert_x509_to_der "${dbs[i]}" "$KEY_DIR/DB.cer"
+        else
+            printf -v dbx 'DB_%02d.cer' "$((i + 1))"
+            convert_x509_to_der "${dbs[i]}" "$KEY_DIR/$dbx"
+        fi
+    done
+    for i in "${!dbxs[@]}"; do
+        printf -v dbx 'DBX_%02d.cer' "$((i + 1))"
+        convert_x509_to_der "${dbxs[i]}" "$KEY_DIR/$dbx"
+    done
+    info "Certificates available in the VM's KEYS/ folder (X.509 DER)."
+    info "Note: staging keys does NOT change PK/KEK/db firmware variables. Enroll in BIOS or run 'enroll-offline'."
+}
+
+cmd_init() {
+    ensure_initialized
+    if (($#)); then stage_keys "$@"; fi
+    info "Firmware CODE: $CODE_PATH"
+    info "Firmware VARS: $VARS_FILE"
+    info "Virtual FAT drive directory: $ESP_DIR"
+}
+
+cmd_boot() {
+    local efi='' disk='' iso='' no_kvm=0 kind='' media='' boot_idx=0 key_idx=0 fmt=raw
+    local token
+    while (($#)); do
+        token="$1"
+        case "$token" in
+            --efi|--disk|--iso)
+                (($# >= 2)) || fail "$token requires a filename"
+                [[ -z "$kind" ]] || fail "Choose only one of --efi, --disk, or --iso"
+                kind="${token#--}"
+                case "$token" in
+                    --efi) efi="$2";;
+                    --disk) disk="$2";;
+                    --iso) iso="$2";;
+                esac
+                shift 2;;
+            --no-kvm) no_kvm=1; shift;;
+            *) fail "Unknown boot option: $token";;
+        esac
+    done
+    ensure_initialized
+    local bin="${QEMU_BIN:-qemu-system-x86_64}"
+    need "$bin"
+    local -a drives=()
+    if [[ -n "$efi" ]]; then
+        cp -- "$(abs_file "$efi")" "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
+        info "Staged EFI bootloader: $ESP_DIR/EFI/BOOT/BOOTX64.EFI"
+    fi
+    if [[ -n "$disk" || -n "$iso" ]]; then
+        # Prevent an older BOOTX64.EFI on the keys drive from taking priority.
+        rm -f -- "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
+        key_idx=1
+        if [[ -n "$disk" ]]; then
+            media="$(abs_file "$disk")"
+            case "$media" in *.qcow2|*.qcow) fmt=qcow2;; esac
+            # IDE disk nodes cannot be marked readonly=on. A temporary QEMU
+            # snapshot overlay prevents writes to the user's source image.
+            drives+=( -drive "if=ide,index=0,media=disk,format=$fmt,snapshot=on,file=$media" )
+        else
+            media="$(abs_file "$iso")"
+            drives+=( -drive "if=ide,index=0,media=cdrom,format=raw,readonly=on,file=$media" )
+        fi
+    fi
+    # QEMU vvfat is read-only by default; IDE hard disks require a writable
+    # block backend, otherwise QEMU aborts with "Block node is read-only".
+    # The ESP staging directory is intentionally guest-writable; avoid changing
+    # files in it on the host while the VM is running.
+    drives+=( -drive "if=ide,index=$key_idx,media=disk,format=raw,file=fat:rw:$ESP_DIR" )
+    local accel=tcg
+    if ((no_kvm == 0)) && [[ -r /dev/kvm && -w /dev/kvm ]]; then accel=kvm; fi
+    info "Launching x86_64 OVMF Secure Boot lab (accel=$accel). Hit ESC during startup for firmware setup."
+    # Using -bios instead of pflash would not give persistent, protected Secure Boot variables.
+    exec "$bin" \
+        -name "SecureBoot-Custom-Keys" \
+        -machine q35,smm=on \
+        -global driver=cfi.pflash01,property=secure,value=on \
+        -accel "$accel" -cpu qemu64 -smp 2 -m 1024 \
+        -drive "if=pflash,format=raw,unit=0,readonly=on,file=$CODE_PATH" \
+        -drive "if=pflash,format=raw,unit=1,file=$VARS_FILE" \
+        "${drives[@]}" \
+        -boot menu=on -vga std -serial mon:stdio -net none
+}
+
+cmd_enroll_offline() {
+    (($# == 0)) || fail "enroll-offline takes no options. Stage keys with './sb-lab keys' first."
+    need virt-fw-vars
+    ensure_initialized
+    [[ -s "$KEY_DIR/PK.cer" && -s "$KEY_DIR/KEK.cer" && -s "$KEY_DIR/DB.cer" ]] || fail "Stage all three key types first (./sb-lab keys --pk ... --kek ... --db ...)"
+    local backup="${VARS_FILE}.before-offline-enrollment.bak" tmp="${VARS_FILE}.tmp.$$"
+    [[ ! -e "$backup" ]] || fail "Previous NVRAM backup exists: $backup. Move it elsewhere before re-enrolling."
+    cp -- "$VARS_FILE" "$backup"
+    # Start from *clean* vendor template: never inherit existing Microsoft certificates.
+    local -a cmd=( virt-fw-vars --input "$VARS_TEMPLATE_PATH" --output "$tmp"
+                  --set-pk-cert "$OWNER_GUID" "$KEY_DIR/PK.cer"
+                  --add-kek-cert "$OWNER_GUID" "$KEY_DIR/KEK.cer"
+                  --microsoft-db none --microsoft-kek none --secure-boot )
+    local f
+    for f in "$KEY_DIR"/DB.cer "$KEY_DIR"/DB_[0-9][0-9].cer; do
+        [[ -f "$f" ]] || continue
+        cmd+=( --add-db-cert "$OWNER_GUID" "$f" )
+    done
+    for f in "$KEY_DIR"/DBX*.cer; do
+        [[ -f "$f" ]] || continue
+        cmd+=( --add-dbx-cert "$OWNER_GUID" "$f" )
+    done
+    if ! "${cmd[@]}"; then rm -f -- "$tmp"; fail "virt-fw-vars failed. Original NVRAM is intact."; fi
+    [[ -s "$tmp" ]] || fail "virt-fw-vars did not produce a VARS image. Original NVRAM is intact."
+    mv -- "$tmp" "$VARS_FILE"
+    chmod u+rw "$VARS_FILE"
+    info "Secure Boot PK/KEK/db installed into $VARS_FILE and enabled."
+    info "Original variables backed up to $backup. This method does not require firmware UI enrollment."
+    virt-fw-vars --input "$VARS_FILE" --print
+}
+
+cmd_status() {
+    (($# == 0)) || fail "status takes no options"
+    [[ -f "$VARS_FILE" ]] || fail "No variable store. Run './sb-lab init' first."
+    info "Current variable store: $VARS_FILE"
+    if command -v virt-fw-vars >/dev/null 2>&1; then
+        virt-fw-vars --input "$VARS_FILE" --print
+    else
+        info "For host-side variable inspection, install virt-fw-vars (virt-firmware)."
+        info "For runtime proof, inspect UEFI Setup's SecureBoot/SetupMode or run 'mokutil --sb-state' in a Linux guest."
+    fi
+    info "Staged certificates:"
+    for f in "$KEY_DIR"/*.cer; do
+        [[ -f "$f" ]] || continue
+        printf '  %s: ' "$(basename "$f")"
+        openssl x509 -inform DER -in "$f" -noout -subject 2>/dev/null || printf 'unreadable certificate\n'
+    done
+}
+
+cmd_reset() {
+    [[ "${1:-}" == '--yes' && $# -eq 1 ]] || fail "To discard enrolled firmware variables, run './sb-lab reset --yes'"
+    find_firmware
+    mkdir -p "$STATE_DIR"
+    cp -- "$VARS_TEMPLATE_PATH" "$VARS_FILE"
+    chmod u+rw "$VARS_FILE"
+    info "Reset UEFI VARS to empty Setup Mode; staged certificates were NOT erased."
+}
+
+cmd_sign() {
+    local infile='' key='' cert='' outfile=''
+    while (($#)); do
+        case "$1" in
+            --efi|--key|--cert|--out)
+                (($# >= 2)) || fail "$1 requires a filename"
+                case "$1" in
+                    --efi) infile="$2";; --key) key="$2";;
+                    --cert) cert="$2";; --out) outfile="$2";;
+                esac
+                shift 2;;
+            *) fail "Unknown sign option: $1";;
+        esac
+    done
+    [[ -n "$infile" && -n "$key" && -n "$cert" && -n "$outfile" ]] || fail "Usage: ./sb-lab sign --efi unsigned.efi --key db.key --cert db.pem --out signed.efi"
+    need sbsign
+    sbsign --key "$(abs_file "$key")" --cert "$(abs_file "$cert")" --output "$outfile" "$(abs_file "$infile")"
+    info "PE/COFF Authenticode-signed EFI file: $outfile"
+}
+
+main() {
+    local command="${1:-help}"
+    if (($#)); then shift; fi
+    case "$command" in
+        help|-h|--help) usage;;
+        init) cmd_init "$@";;
+        keys) stage_keys "$@";;
+        boot|run) cmd_boot "$@";;
+        enroll-offline) cmd_enroll_offline "$@";;
+        status) cmd_status "$@";;
+        reset) cmd_reset "$@";;
+        sign) cmd_sign "$@";;
+        *) usage >&2; fail "Unknown command: $command";;
+    esac
+}
+main "$@"

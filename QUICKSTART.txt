@@ -1,0 +1,34 @@
+QEMU x86_64 Secure Boot / custom PK, KEK, db - QUICKSTART
+
+NixOS (recommended):
+
+  nix develop
+  # Or, with a traditional channel: nix-shell
+
+  ./sb-lab init --pk /path/PK.cer --kek /path/KEK.cer --db /path/DB.cer
+  ./sb-lab boot
+
+In the QEMU OVMF firmware UI (press Esc):
+  Device Manager > Secure Boot Configuration > Custom Mode.
+  Enroll KEYS/DB.cer, then KEYS/KEK.cer, then KEYS/PK.cer LAST.
+  Ensure Secure Boot is enabled and SecureBoot=1 before testing.
+
+To boot your signed .efi binary:
+  ./sb-lab boot --efi /path/signed.efi
+
+To boot an existing UEFI disk:
+  ./sb-lab boot --disk /path/uefi.img
+
+Or automatically pre-enroll all staged certificates:
+  ./sb-lab enroll-offline
+  ./sb-lab status
+  ./sb-lab boot --efi /path/signed.efi
+
+Certificates are X.509 in PEM/DER. No private keys are sent to guest.
+The firmware NVRAM persists at work/OVMF_VARS.fd.
+
+The shell sets OVMF_CODE and OVMF_VARS_TEMPLATE from a custom NixOS
+Secure Boot-capable OVMF derivation (not the default non-SB OVMF).
+
+See README.md for details and troubleshooting. You need an x86_64-linux host
+for the Nix dev shell. The Nix flake uses nixos-26.05 nixpkgs.
