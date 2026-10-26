@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # QEMU x86_64 + OVMF Secure Boot lab. No root needed to run.
+# Supports installation from ISO onto a persistent qcow2/raw target disk.
 set -Eeuo pipefail
 
 LAB_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,13 +19,25 @@ usage() {
 cat <<'USAGE'
 QEMU x86_64 UEFI Secure Boot lab (host: Linux)
 
-  ./sb-lab init [--pk PK.pem|cer --kek KEK.pem|cer --db DB.pem|cer ...]
-  ./sb-lab keys --pk PK.pem|cer --kek KEK.pem|cer --db DB.pem|cer [--db DB2.cer ...] [--dbx revocation-cert.cer ...]
-  ./sb-lab boot [--efi signed.efi | --disk uefi-disk.img | --iso installer.iso] [--no-kvm]
-  ./sb-lab enroll-offline     # requires virt-fw-vars; replaces VM's NVRAM
+  ./sb-lab init [--pk PK.pem --kek KEK.pem --db DB.pem ...]
+  ./sb-lab keys --pk PK.pem --kek KEK.pem --db DB.pem [--db DB2.cer ...] [--dbx DBX.cer ...]
+  ./sb-lab boot [--efi signed.efi | --disk uefi-disk.img | --iso installer.iso] [OPTIONS]
+  ./sb-lab enroll-offline       # requires virt-fw-vars; replaces VM's NVRAM
   ./sb-lab status
   ./sb-lab sign --efi input.efi --key DB.key --cert DB.pem --out signed.efi
-  ./sb-lab reset --yes       # resets firmware variables, NOT staged keys
+  ./sb-lab reset --yes         # resets firmware variables, NOT staged keys
+
+Boot options:
+  --iso FILE                   Boot a read-only installer ISO
+  --target-disk FILE           Attach an existing, writable target disk alongside --iso
+  --disk FILE                  Boot an existing disk image (raw or qcow2)
+  --persistent                 Make --disk writes persistent (default: snapshot overlay)
+  --efi FILE                   Stage/boot a single EFI program
+  --memory MIB                 VM RAM in MiB (default: 8192)
+  --cpus N                     Number of virtual CPUs (default: 4)
+  --cpu MODEL                  QEMU CPU model (default: qemu64; host needs KVM)
+  --serial log|stdio|none      Serial output (default: log, in work/serial.log)
+  --no-kvm                     Force software emulation (TCG)
 
 Environment overrides:
   OVMF_CODE=/path/to/OVMF_CODE_4M.secboot.fd
@@ -32,9 +45,18 @@ Environment overrides:
   QEMU_BIN=/path/to/qemu-system-x86_64
   SB_LAB_STATE_DIR=/path/to/work
 
-Run 'init' once, 'boot' to enroll keys manually in UEFI setup, and 'boot --efi'
-to verify the signed EFI program. For immediate Secure Boot=1, use
-'enroll-offline' after staging your keys (requires virt-fw-vars).
+Example:
+  qemu-img create -f qcow2 work/ghaf-target.qcow2 64G
+  ./sb-lab boot --iso signed-ghaf-installer.iso --target-disk work/ghaf-target.qcow2
+  ./sb-lab boot --disk work/ghaf-target.qcow2 --persistent
+
+Run 'init' once. 'enroll-offline' installs staged PK/KEK/db and enables
+Secure Boot enforcement. Guest disks and firmware variables persist separately:
+  work/ghaf-target.qcow2   - installed system
+  work/OVMF_VARS.fd        - enrolled firmware keys and settings
+
+Warning: --persistent and --target-disk can modify/overwrite the selected file.
+Keep backup copies. Never boot the same disk writable in two QEMU processes.
 USAGE
 }
 
@@ -147,9 +169,21 @@ cmd_init() {
     info "Virtual FAT drive directory: $ESP_DIR"
 }
 
+# Determine the QEMU disk format from the extension. Verify the image exists;
+# this command intentionally never creates/overwrites a disk implicitly.
+disk_format() {
+    case "$1" in
+        *.qcow2|*.qcow) printf 'qcow2\n';;
+        *) printf 'raw\n';;
+    esac
+}
+
 cmd_boot() {
-    local efi='' disk='' iso='' no_kvm=0 kind='' media='' boot_idx=0 key_idx=0 fmt=raw
-    local token
+    local efi='' disk='' iso='' target_disk='' kind='' media='' token
+    local persistent=0 no_kvm=0 memory=8192 cpus=4 cpu_model=qemu64
+    local serial_mode=log key_idx=0 fmt=raw accel=tcg
+    local -a drives=() serial_args=()
+
     while (($#)); do
         token="$1"
         case "$token" in
@@ -163,58 +197,140 @@ cmd_boot() {
                     --iso) iso="$2";;
                 esac
                 shift 2;;
-            --no-kvm) no_kvm=1; shift;;
-            *) fail "Unknown boot option: $token";;
+            --target-disk)
+                (($# >= 2)) || fail "--target-disk requires a filename"
+                target_disk="$2"
+                shift 2;;
+            --persistent)
+                persistent=1
+                shift;;
+            --memory)
+                (($# >= 2)) || fail "--memory requires a number in MiB"
+                memory="$2"
+                shift 2;;
+            --cpus)
+                (($# >= 2)) || fail "--cpus requires a number"
+                cpus="$2"
+                shift 2;;
+            --cpu)
+                (($# >= 2)) || fail "--cpu requires a QEMU CPU model"
+                cpu_model="$2"
+                shift 2;;
+            --serial)
+                (($# >= 2)) || fail "--serial requires log, stdio, or none"
+                serial_mode="$2"
+                shift 2;;
+            --no-kvm)
+                no_kvm=1
+                shift;;
+            *)
+                fail "Unknown boot option: $token";;
         esac
     done
+
+    [[ "$memory" =~ ^[0-9]+$ ]] && (( 10#$memory >= 256 )) ||
+        fail "--memory must be an integer >= 256 MiB"
+    [[ "$cpus" =~ ^[0-9]+$ ]] && (( 10#$cpus >= 1 && 10#$cpus <= 128 )) ||
+        fail "--cpus must be an integer between 1 and 128"
+    case "$serial_mode" in
+        log|stdio|none) ;;
+        *) fail "--serial must be one of: log, stdio, none";;
+    esac
+    [[ -n "$cpu_model" ]] || fail "--cpu cannot be empty"
+    [[ -z "$target_disk" || "$kind" == iso ]] ||
+        fail "--target-disk can only be used with --iso"
+    (( ! persistent )) || [[ "$kind" == disk ]] ||
+        fail "--persistent can only be used with --disk"
+
     ensure_initialized
     local bin="${QEMU_BIN:-qemu-system-x86_64}"
     need "$bin"
-    local -a drives=()
+
     if [[ -n "$efi" ]]; then
         cp -- "$(abs_file "$efi")" "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
         info "Staged EFI bootloader: $ESP_DIR/EFI/BOOT/BOOTX64.EFI"
     fi
+
     if [[ -n "$disk" || -n "$iso" ]]; then
-        # Prevent an older BOOTX64.EFI on the keys drive from taking priority.
+        # Prevent an older BOOTX64.EFI on the key drive from taking priority.
         rm -f -- "$ESP_DIR/EFI/BOOT/BOOTX64.EFI"
         key_idx=1
+
         if [[ -n "$disk" ]]; then
             media="$(abs_file "$disk")"
-            case "$media" in *.qcow2|*.qcow) fmt=qcow2;; esac
-            # IDE disk nodes cannot be marked readonly=on. A temporary QEMU
-            # snapshot overlay prevents writes to the user's source image.
-            drives+=( -drive "if=ide,index=0,media=disk,format=$fmt,snapshot=on,file=$media" )
+            fmt="$(disk_format "$media")"
+            if (( persistent )); then
+                # Writes go directly into the selected disk image.
+                drives+=( -drive "if=ide,index=0,media=disk,format=$fmt,file=$media" )
+            else
+                # Preserve original qemu-lab behavior: disposable changes.
+                drives+=( -drive "if=ide,index=0,media=disk,format=$fmt,snapshot=on,file=$media" )
+            fi
         else
             media="$(abs_file "$iso")"
             drives+=( -drive "if=ide,index=0,media=cdrom,format=raw,readonly=on,file=$media" )
         fi
     fi
-    # QEMU vvfat is read-only by default; IDE hard disks require a writable
-    # block backend, otherwise QEMU aborts with "Block node is read-only".
-    # The ESP staging directory is intentionally guest-writable; avoid changing
-    # files in it on the host while the VM is running.
+
+    if [[ -n "$target_disk" ]]; then
+        local target_path target_fmt
+        target_path="$(abs_file "$target_disk")"
+        target_fmt="$(disk_format "$target_path")"
+        [[ "$target_path" != "$media" ]] || fail "Target disk cannot also be the ISO"
+        # A separate, writable IDE disk that the installer can partition.
+        drives+=( -drive "if=ide,index=1,media=disk,format=$target_fmt,file=$target_path" )
+        key_idx=2
+        info "Persistent install target: $target_path"
+    fi
+
+    # QEMU vvfat is read-only by default; IDE hard disks need a writable
+    # block backend. This key-media FAT disk is intentionally guest-writable.
+    # Do not modify files in this host directory while QEMU is running.
     drives+=( -drive "if=ide,index=$key_idx,media=disk,format=raw,file=fat:rw:$ESP_DIR" )
-    local accel=tcg
-    if ((no_kvm == 0)) && [[ -r /dev/kvm && -w /dev/kvm ]]; then accel=kvm; fi
-    info "Launching x86_64 OVMF Secure Boot lab (accel=$accel). Hit ESC during startup for firmware setup."
+
+    if (( ! no_kvm )) && [[ -r /dev/kvm && -w /dev/kvm ]]; then
+        accel=kvm
+    fi
+    if [[ "$cpu_model" == host && "$accel" != kvm ]]; then
+        fail "--cpu host requires available KVM; remove --no-kvm and check /dev/kvm"
+    fi
+
+    case "$serial_mode" in
+        log)
+            mkdir -p "$STATE_DIR"
+            serial_args=( -serial "file:$STATE_DIR/serial.log" -monitor none )
+            info "Guest serial output: $STATE_DIR/serial.log"
+            ;;
+        stdio)
+            # Original lab behavior: serial + monitor share the terminal.
+            serial_args=( -serial mon:stdio )
+            ;;
+        none)
+            serial_args=( -serial none -monitor none )
+            ;;
+    esac
+
+    info "Launching x86_64 OVMF Secure Boot lab (accel=$accel, RAM=${memory}MiB, CPUs=$cpus)."
+    info "Hit ESC during startup for firmware setup. The VM opens a graphical window."
+
     # Using -bios instead of pflash would not give persistent, protected Secure Boot variables.
     exec "$bin" \
         -name "SecureBoot-Custom-Keys" \
         -machine q35,smm=on \
         -global driver=cfi.pflash01,property=secure,value=on \
-        -accel "$accel" -cpu qemu64 -smp 2 -m 1024 \
+        -accel "$accel" -cpu "$cpu_model" -smp "$cpus" -m "$memory" \
         -drive "if=pflash,format=raw,unit=0,readonly=on,file=$CODE_PATH" \
         -drive "if=pflash,format=raw,unit=1,file=$VARS_FILE" \
         "${drives[@]}" \
-        -boot menu=on -vga std -serial mon:stdio -net none
+        -boot menu=on -vga std "${serial_args[@]}" -net none
 }
 
 cmd_enroll_offline() {
     (($# == 0)) || fail "enroll-offline takes no options. Stage keys with './sb-lab keys' first."
     need virt-fw-vars
     ensure_initialized
-    [[ -s "$KEY_DIR/PK.cer" && -s "$KEY_DIR/KEK.cer" && -s "$KEY_DIR/DB.cer" ]] || fail "Stage all three key types first (./sb-lab keys --pk ... --kek ... --db ...)"
+    [[ -s "$KEY_DIR/PK.cer" && -s "$KEY_DIR/KEK.cer" && -s "$KEY_DIR/DB.cer" ]] ||
+        fail "Stage all three key types first (./sb-lab keys --pk ... --kek ... --db ...)"
     local backup="${VARS_FILE}.before-offline-enrollment.bak" tmp="${VARS_FILE}.tmp.$$"
     [[ ! -e "$backup" ]] || fail "Previous NVRAM backup exists: $backup. Move it elsewhere before re-enrolling."
     cp -- "$VARS_FILE" "$backup"
@@ -282,7 +398,8 @@ cmd_sign() {
             *) fail "Unknown sign option: $1";;
         esac
     done
-    [[ -n "$infile" && -n "$key" && -n "$cert" && -n "$outfile" ]] || fail "Usage: ./sb-lab sign --efi unsigned.efi --key db.key --cert db.pem --out signed.efi"
+    [[ -n "$infile" && -n "$key" && -n "$cert" && -n "$outfile" ]] ||
+        fail "Usage: ./sb-lab sign --efi unsigned.efi --key db.key --cert db.pem --out signed.efi"
     need sbsign
     sbsign --key "$(abs_file "$key")" --cert "$(abs_file "$cert")" --output "$outfile" "$(abs_file "$infile")"
     info "PE/COFF Authenticode-signed EFI file: $outfile"
