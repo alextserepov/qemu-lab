@@ -172,9 +172,15 @@ cmd_init() {
 # Determine the QEMU disk format from the extension. Verify the image exists;
 # this command intentionally never creates/overwrites a disk implicitly.
 disk_format() {
-    case "$1" in
-        *.qcow2|*.qcow) printf 'qcow2\n';;
-        *) printf 'raw\n';;
+    need qemu-img
+    need jq
+
+    local fmt
+    fmt="$(qemu-img info --output=json "$1" | jq -r '.format')"
+
+    case "$fmt" in
+        qcow2|raw) printf '%s\n' "$fmt";;
+        *) fail "Unsupported disk format: $fmt";;
     esac
 }
 
